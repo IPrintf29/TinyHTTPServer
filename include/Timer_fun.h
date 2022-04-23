@@ -10,7 +10,7 @@
 #include "epoll_fun.h"
 #include "http_conn.h"
 
-#define TIMESLOT 10
+#define TIMESLOT 3
 
 //信号处理函数
 void sig_handler( int sig );

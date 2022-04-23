@@ -4,6 +4,7 @@
 #include <time.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <mutex>
 
 #define BUFFER_SIZE 64
 
@@ -23,11 +24,6 @@ public:    //方法
 	tw_timer( int rot, int ts )
 	: next(nullptr), prev(nullptr), user_data(nullptr), rotation( rot ), time_slot( ts ){}
 
-	/*~tw_timer() {
-		if (user_data != nullptr)
-			cb_func(user_data);
-		user_data = nullptr;
-	}*/
 public:    
 	int rotation;                     
 	int time_slot;                    
@@ -68,6 +64,8 @@ public:
 		int ts = ( cur_slot + ( ticks % N ) ) % N;
 		tw_timer *timer = new tw_timer( rotation, ts);
 
+		//对槽上锁
+		std::lock_guard<std::mutex> lock(mutexslots[ts]);
 		if ( !slots[ts] )
 			slots[ts] = timer;
 		else {
@@ -84,6 +82,8 @@ public:
 			return;
 
 		int ts = timer->time_slot;
+		//对槽上锁
+		std::lock_guard<std::mutex> lock(mutexslots[ts]);
 		if ( timer == slots[ts] ){             
 			slots[ts] = timer->next;
 			if ( slots[ts] )
@@ -101,6 +101,8 @@ public:
 	}
 
 	void adjust_timer( tw_timer *&timer, int timeout ){
+	/*
+	#ifdef OLD_VERSION
 		if ( timeout < 0)
 			return;
 		int ticks = 0;
@@ -135,10 +137,18 @@ public:
 			slots[ts]->prev = timer;
 			slots[ts] = timer;
 		}
-
+	#endif
+	*/
+		int ts = timer->time_slot;
+		//对槽上锁
+		std::lock_guard<std::mutex> lock(mutexslots[ts]);
+		if (timer->rotation == 0)
+			++timer->rotation;
 	}
 
 	void tick(){
+		//对槽上锁
+		std::lock_guard<std::mutex> lock(mutexslots[cur_slot]);
 		tw_timer *tmp = slots[cur_slot];
 
 		while ( tmp ){
@@ -173,6 +183,8 @@ private:
 	static const int N = 60;       
 	static const int SI = 1;       
 	tw_timer *slots[N];            
+	//一个槽对应一个锁
+	std::mutex mutexslots[N];
 	int cur_slot;                  
 };
 

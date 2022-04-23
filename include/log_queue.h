@@ -119,6 +119,7 @@ public:
 	bool pop(T &item) {
 		m_mutex.lock();
 		//必须while，条件变量
+		//return false 是对的 这里只有一个消费者: 写线程
 		while (m_size <= 0) {
 			if (!m_cond.wait(m_mutex.get())) {
 				m_mutex.unlock();

@@ -134,14 +134,11 @@ void Log::write_log(int level, const char *format, ...) {
 
 	//异步，加入队列中
 	if (m_is_async && !m_log_queue->full()) {
-		//printf("yibu\n");
 		m_log_queue->push(log_str);
 	}
 	//同步，直接打印
 	else {
-		//printf("tongbu\n");
 		m_mutex.lock();
-		//printf("tongbu_lock\n");
 		fputs(log_str.c_str(), m_fp);
 		m_mutex.unlock();
 	}

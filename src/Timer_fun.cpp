@@ -27,7 +27,7 @@ void addsig( int sig ){
 void timer_handler() {
 	//一个SIGALRM，一次滴答
 	timer_lst.tick();
-	//重新发送SIGALRM信号，每10s一次
+	//重新发送SIGALRM信号，每3s一次
 	alarm( TIMESLOT );
 }
 

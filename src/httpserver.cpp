@@ -203,8 +203,8 @@ int main( int argc, char *argv[] ) {
 
 				timer_users[connfd].address = client_address;
 				timer_users[connfd].sockfd = connfd;
-                //创建定时器 6 * 10s
-				tw_timer *timer = timer_lst.add_timer( 10 );
+                //创建定时器 60 * 2s, 一圈
+				tw_timer *timer = timer_lst.add_timer( 60 );
 				timer->user_data = &timer_users[connfd];
 				timer->cb_func = cb_func;
 				timer_users[connfd].timer = timer;
@@ -251,7 +251,8 @@ int main( int argc, char *argv[] ) {
 				if ( http_users[ sockfd ].read() ) {
 					pool->append( http_users + sockfd );
 					if ( timer_users[sockfd].timer ) {
-						timer_lst.adjust_timer( timer_users[sockfd].timer, 10 );
+						//移动定时器, 在此基础上加一圈 或 不变
+						timer_lst.adjust_timer( timer_users[sockfd].timer, 0 );
 						LOG_INFO("%s", "adjust timer once\n");
 					}
 				}

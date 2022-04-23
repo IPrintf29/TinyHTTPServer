@@ -41,9 +41,7 @@ private:
 	void *async_write_log() {
 		string single_log;
 		while (m_log_queue->pop(single_log)) {
-			//printf("yibu_into");
 			m_mutex.lock();
-			//printf("yibu_into_lock");
 			fputs(single_log.c_str(), m_fp);
 			m_mutex.unlock();
 		}
