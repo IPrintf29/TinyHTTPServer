@@ -138,10 +138,10 @@ int main( int argc, char *argv[] ) {
 
 	//日志相关
 	if (log_mode == 1)
-	//同步
-		Log::get_instance()->init("./ServerLogFolder/ServerLog", 0, 2000, 800000, 800);
-	else
 	//异步
+		Log::get_instance()->init("./ServerLogFolder/ServerLog", 0, 2000, 800000, 8000);
+	else
+	//同步
 		Log::get_instance()->init("./ServerLogFolder/ServerLog", 0, 2000, 800000, 0);
 	//记录IP地址
 	char *Connect_IP = new char[16]();
@@ -290,6 +290,7 @@ int main( int argc, char *argv[] ) {
 	delete [] http_users;
 	delete [] timer_users;
 	delete pool;
+	delete [] Connect_IP;
 	//delete timer_lst; 
 	
 	return 0;
