@@ -173,6 +173,8 @@ int main( int argc, char *argv[] ) {
 		//http_conn::clientsInfo[temp1] = temp2;
         http_conn::clientsInfo.PutValue(temp1, temp2);
 	}
+	//释放内存
+	mysql_free_result(result);
 
 	//处理事件循环
 	while ( !stop_server ) {

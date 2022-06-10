@@ -25,6 +25,7 @@ bool Log::init(const char *file_name, int close_log, int log_buf_size, int split
 		m_log_queue = new log_queue<string>(max_queue_size);
 		pthread_t tid;
 		pthread_create(&tid, nullptr, flush_log_thread, nullptr);
+		pthread_detach(tid);
 	}
 	else
 		m_is_async = false;
