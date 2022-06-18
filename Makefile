@@ -10,7 +10,7 @@ SRC = $(wildcard $(DIR_SRC)/*.cpp)
 OBJ = $(patsubst %.cpp,$(DIR_OBJ)/%.o,$(notdir $(SRC)))
 
 
-CXX_FLAG = -g -Wall -Iinclude -std=c++11 -pthread -O0 -L/usr/lib64/mysql -lmysqlclient 
+CXX_FLAG = -D _CPLUSPLUS11 -Wall -Iinclude -std=c++11 -pthread -O0 -L/usr/lib64/mysql -lmysqlclient -lrt
 CC = g++
 
 TARGET1 = httpserver

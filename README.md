@@ -7,20 +7,21 @@
 * 支持**同步/异步日志系统**,记录客户端连接等信息;  
 * 服务器连接MySQL数据库,Web端能够简单实现**用户注册/登录**访问功能.  
 * 服务器能够自动关闭非活跃的客户端连接;  
-* 经WebBench压力测试,该服务器至少支持**上万客户端的并发连接**。
+* 经WebBench压力测试,该服务器至少支持**上千客户端的并发连接**。
 *********
 
 ## **技术要点**
-* **基于epoll的IO多路复用 + 非阻塞IO + ET边沿触发**,使用Reactor模型,  
+* **基于epoll的IO多路复用 + 非阻塞IO + ET边沿触发**,使用模拟Proactor模型,
     主线程负责接收信号和事件，子线程负责处理客户请求;  
 * 利用多线程机制提供服务，增加并行服务数量，使用**线程池**减少频繁创建线程的开销;  
 * 采用匿名管道接收信号,主线程统一事件源,epoll事件表一并接收信号和客户请求;  
 * 使用**时间轮结构实现定时器**，对非活动客户端连接自动关闭;  
-* 手写简易LRU缓存 + 数据库连接池, 避免频繁地访问数据库内容.
+* 手写简易LRU缓存 + 数据库连接池, 避免频繁地访问数据库内容;  
+* 新增**异步IO实现Proactor模型**, 并且对比模拟Proactor模型在Linux平台上进行简单的性能分析。
 *********
 
 ## **项目框架**
-![项目框架](./project_frame.jpg)
+![项目框架](./project_frame.svg)
 
 ## **开发部署环境**
 - 服务器运行环境
@@ -62,10 +63,22 @@
     ```
 - 启动
     ```
-    ./httpserver 127.0.0.1/*IP Address*/ 8888/*Port*/ 1/*Log Mode*/
+    ./httpserver 127.0.0.1/*IP Address*/ 8888/*Port*/ 1/*Log Mode*/ 1/*I/O Mode*/
     ```
 - 压力测试
     ```
-    ./WebBench -2k -c 10000 -t 5 http://127.0.0.1:8888/
+    ./WebBench -2k -c 5000 -t 5 http://127.0.0.1:8888/
     ```
-    ![测试结果](./webbench.png)
+
+## **模型性能比对**  
+- 压力测试结果对比 (5000 客户端连接, 持续5s)
+    - 同步I/O 模拟Proactor模型测试结果
+    ![同步I/O 模拟Proactor模型测试结果](./syncIO_test.png)
+    - 异步I/O Proactor模型测试结果
+    ![异步I/O Proactor模型测试结果](./asyncIO_test.png)
+- On CPU 堆栈分析
+    - 同步I/O 模拟Proactor火焰图
+    ![同步I/O 模拟Proactor火焰图](./syncIO_flame.svg)
+    - 异步I/O Proactor火焰图
+    ![异步I/O Proactor火焰图](./asyncIO_flame.svg)
+

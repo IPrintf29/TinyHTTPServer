@@ -13,6 +13,12 @@ void error_fun(int ret, const char* s);
 //设置描述符非阻塞，accept,connect,read,write等操作都立即返回
 int setnonblocking( int fd );
 
+//设置描述符添加，accept,connect,read,write等操作都立即返回
+int setappend(int fd);
+
+//设置描述符异步，accept,connect,read,write等操作都立即返回
+int setasync(int fd);
+
 //向epoll事件表中添加文件描述符及对应事件
 void addfd( int epollfd, int fd, bool one_shot );
 

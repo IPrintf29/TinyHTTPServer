@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <map>
 #include <mysql/mysql.h>
+#include <aio.h>
 
 #include "../include/locker.h"
 #include "../include/http_conn.h"
@@ -31,13 +32,41 @@
 #define MAX_FD 65535
 //最大事件表註冊事件
 #define MAX_EVENT_NUMBER 10000
+//设置异步I/O模式下信号
+#define ASYNC_READ SIGUSR1
+#define ASYNC_WRITE SIGUSR2
 
-//全局變量 http_conn數組
-http_conn *http_users = NULL;
+
+struct EpollInfo
+{
+	/* data */
+	int epollfd;			//epoll事件表句柄
+	int listenfd;			//监听套接字
+	epoll_event *events;	//监听事件
+
+	char *Connect_IP;		//IP地址
+
+	bool timeout;			//定时事件触发
+	bool stop_server;		//关闭server
+
+	int ret;				//返回值
+};
+
+//全局变量 设定IO模式
+bool isSync = true;
+
+//全局变量 http_conn數組
+http_conn *http_users = nullptr;
 //全局变量 管道用于信号
 int pipefd[2];
+//全局变量 客户连接信息: fd 定时器
+client_data *timer_users = nullptr;
 //全局变量 时间轮用于定时关闭客户端
 time_wheel timer_lst;
+//全局变量 线程池
+threadpool<http_conn> *pool = nullptr;
+//全局变量 异步IO使用 aiocb数组
+struct aiocb64 *aiocbData = nullptr;
 //全局变量 记录用户名字和密码
 //map<string, string> clientsInfo;
 //全局变量 程序的当前工作路径
@@ -48,18 +77,240 @@ void show_error( int connfd, const char *info ) {
 	close( connfd );
 }
 
+//模拟Proactor
+//int Sync_IO_EventLoop(bool &stop_server, int &epollfd, epoll_event *events, int &listenfd, 
+//	client_data *timer_users, char *Connect_IP, int &ret, bool &timeout, 
+//	threadpool<http_conn> *pool) {
+int Sync_IO_EventLoop(struct EpollInfo &info) {
+	//处理事件循环
+	while ( !info.stop_server ) {
+		//epoll_wait 只监听listenfd, 管道信号, 不监听connfd
+		int number = epoll_wait( info.epollfd, info.events, 
+		MAX_EVENT_NUMBER, -1 );
+		if ( ( number < 0 ) && ( errno != EINTR ) ) {
+			LOG_ERROR("epoll failure\n");
+			break;
+		}
+		for ( int i = 0; i < number; i++ ) {
+			int sockfd = info.events[i].data.fd;
+			if ( sockfd == info.listenfd ) {
+				struct sockaddr_in client_address;
+				socklen_t client_addrlength = 
+				sizeof( client_address);
+                //accept连接
+				int connfd = accept( info.listenfd, ( struct sockaddr*)
+				&client_address, &client_addrlength );
+				if ( connfd < 0 ) {
+                    LOG_ERROR("errno is :%d\n", errno);
+					continue;
+				}
+				if (http_conn::m_user_count >= MAX_FD ) {
+					continue;
+				}
+				//初始化连接
+				http_users[connfd].init_sync( connfd, client_address );
+
+				timer_users[connfd].address = client_address;
+				timer_users[connfd].sockfd = connfd;
+                //创建定时器 60 * 2s, 一圈
+				tw_timer *timer = timer_lst.add_timer( 60 );
+				timer->user_data = &timer_users[connfd];
+				timer->cb_func = cb_func;
+				timer_users[connfd].timer = timer;
+				//日志写入，有新的连接
+				inet_ntop(AF_INET, &client_address.sin_addr.s_addr, info.Connect_IP, INET_ADDRSTRLEN);
+				LOG_INFO("New Client Connect: %s:%d", info.Connect_IP, client_address.sin_port);
+			}
+			//管道 信号事件
+			else if ((sockfd == pipefd[0]) && 
+			(info.events[i].events & EPOLLIN)){
+				char signals[1024];
+				info.ret = recv( pipefd[0], signals, 
+				sizeof(signals), 0);
+				if ( info.ret <= 0)
+					continue;
+				else{
+					for (int i = 0; i < info.ret; i++)
+						switch (signals[i]){
+						case SIGHUP:
+						case SIGCHLD:
+						case SIGPIPE:
+							continue;
+						case SIGTERM:
+						case SIGINT:{
+							info.stop_server = true;
+							break;
+							}
+						case SIGALRM:{
+							info.timeout = true;
+							break;
+							}
+						}
+				}
+			}
+			//如果有异常，直接关闭连接
+			else if ( info.events[i].events & ( EPOLLRDHUP | 
+			EPOLLHUP | EPOLLERR ) ) {
+				if ( timer_users[sockfd].timer )
+					timer_lst.del_timer( timer_users[sockfd].timer );
+				cb_func( &timer_users[sockfd] );
+			}
+			//连接套接字接收到读事件
+			else if ( info.events[i].events & EPOLLIN ) {
+				if ( http_users[ sockfd ].read() ) {
+					pool->append( http_users + sockfd );
+					if ( timer_users[sockfd].timer ) {
+						//移动定时器, 在此基础上加一圈 或 不变
+						timer_lst.adjust_timer( timer_users[sockfd].timer, 0 );
+						//LOG_INFO("%s", "adjust timer once\n");
+					}
+				}
+				else {
+					if ( timer_users[sockfd].timer )
+						timer_lst.del_timer( timer_users[sockfd].timer );
+					cb_func( &timer_users[sockfd] );
+				}
+			}
+			//连接套接字接收到写事件
+			else if ( info.events[i].events & EPOLLOUT ) {
+				if ( !http_users[ sockfd ].write() ) {
+					//LOG_ERROR("Write Error, Client Close: %s:%d", inet_ntop(timer_users[connfd].address.sin_addr.s_addr), timer_users[connfd].address.sin_port);
+					if ( timer_users[sockfd].timer )
+						timer_lst.del_timer( timer_users[sockfd].timer );
+					cb_func( &timer_users[sockfd] );
+				}
+			}
+			else
+				return 0;
+		}
+		//若接收到SIGALRM，执行timer_handler()
+		//timer_handler 时间轮转动一个刻度
+		if ( info.timeout ){
+			timer_handler();
+			info.timeout = false;
+		}
+
+	}
+
+	return 1;
+}
+
+//Proactor
+int Async_IO_EventLoop(struct EpollInfo &info) {
+	//添加异步完成事件触发信号
+	addsig_aioread(ASYNC_READ);
+	addsig_aiowrite(ASYNC_WRITE);
+	//aiocb结构体, 初始化, 连接socket和读写缓冲区
+	aiocbData = new aiocb64[MAX_FD];
+	for (int i = 0; i < MAX_EVENT_NUMBER; ++i) {
+		aiocbData[i].aio_nbytes = 1024;
+		aiocbData[i].aio_reqprio = 0;
+		aiocbData[i].aio_offset = 0;
+		//信号通知方法
+		aiocbData[i].aio_sigevent.sigev_notify = SIGEV_SIGNAL;
+		//线程回调方法
+		//aiocbData[i].aio_sigevent.sigev_notify = SIGEV_THREAD;
+	}
+	
+	//处理事件循环
+	while ( !info.stop_server ) {
+		int number = epoll_wait( info.epollfd, info.events, 
+		MAX_EVENT_NUMBER, -1 );
+		if ( ( number < 0 ) && ( errno != EINTR ) ) {
+			LOG_ERROR("epoll failure\n");
+			break;
+		}
+		for ( int i = 0; i < number; i++ ) {
+			int sockfd = info.events[i].data.fd;
+			if ( sockfd == info.listenfd ) {
+				struct sockaddr_in client_address;
+				socklen_t client_addrlength = 
+				sizeof( client_address);
+                //accept连接
+				int connfd = accept( info.listenfd, ( struct sockaddr*)
+				&client_address, &client_addrlength );
+				if ( connfd < 0 ) {
+                    LOG_ERROR("errno is :%d\n", errno);
+					continue;
+				}
+				//初始化连接, 异步IO
+				http_users[connfd].init_async( connfd, client_address );
+				//aiocb连接 http_user 和 sockfd
+				aiocbData[connfd].aio_buf = http_users[connfd].parser.m_read_buf;
+				aiocbData[connfd].aio_fildes = connfd;
+				//aio_read 触发信号及传递参数sigev_value
+				//信号传递方法
+				aiocbData[connfd].aio_sigevent.sigev_signo = ASYNC_READ;
+				//线程回调方法
+				//aiocbData[connfd].aio_sigevent.sigev_notify_function = thread_handler_aioread;
+				aiocbData[connfd].aio_sigevent.sigev_value.sival_int = connfd;
+
+				timer_users[connfd].address = client_address;
+				timer_users[connfd].sockfd = connfd;
+                //创建定时器 60 * 2s, 一圈
+				tw_timer *timer = timer_lst.add_timer( 60 );
+				timer->user_data = &timer_users[connfd];
+				timer->cb_func = cb_func;
+				timer_users[connfd].timer = timer;
+				//日志写入，有新的连接
+				inet_ntop(AF_INET, &client_address.sin_addr.s_addr, info.Connect_IP, INET_ADDRSTRLEN);
+				LOG_INFO("New Client Connect: %s:%d",info.Connect_IP, client_address.sin_port);
+
+				//开启异步读取
+				aio_read64(&aiocbData[connfd]);
+			}
+			//管道 信号事件
+			else if ((sockfd == pipefd[0]) && 
+			(info.events[i].events & EPOLLIN)){
+				char signals[1024];
+				info.ret = recv( pipefd[0], signals, 
+				sizeof(signals), 0);
+				if ( info.ret <= 0)
+					continue;
+				else{
+					for (int i = 0; i < info.ret; i++)
+						switch (signals[i]){
+						case SIGHUP:
+						case SIGCHLD:
+						case SIGPIPE:
+							continue;
+						case SIGTERM:
+						case SIGINT:{
+							info.stop_server = true;
+							break;
+							}
+						case SIGALRM:{
+							info.timeout = true;
+							break;
+							}
+						}
+				}
+			}
+			else
+				return 0;
+		}
+		//若接收到SIGALRM，执行timer_handler()
+		//timer_handler 时间轮转动一个刻度
+		if ( info.timeout ){
+			timer_handler();
+			info.timeout = false;
+		}
+		
+	}
+
+	delete [] aiocbData;
+	return 1;
+}
+
 int main( int argc, char *argv[] ) {
-	if ( argc <= 2 ) {
+	if ( argc <= 3 ) {
 		printf( "usage: %s ip_address port_number\n", 
 		basename( argv[0] ) );
 		return 1;
 	}
-	//参数格式 IP PORT LOGMODE
+	//参数格式 IP PORT LOGMODE I/OMODE
 	const char *ip = argv[1];
-	int port = atoi( argv[2] );
-    //获取工作路径
-    getcwd(RootPath, sizeof(RootPath));
-    strcat(RootPath, "/HTMLsource");
+	int port = atoi(argv[2]);
 	//log_mode 0 同步 1 异步
 	int log_mode = 0;
 	if (argc >= 3)
@@ -68,8 +319,26 @@ int main( int argc, char *argv[] ) {
 		printf("Log Mode : Synchronous.\n");
 	else
 		printf("Log Mode : Asynchronous.\n");
+	// I/O mode 0 同步 1 异步
+	int iomode = atoi(argv[4]);
+	if (iomode == 1) {
+		isSync = false;
+		printf("I/O Mode : Asynchronous.\n");
+	}
+	else {
+		isSync = true;
+		printf("I/O Mode : Synchronous.\n");
+	}
+	
+    //获取工作路径
+    getcwd(RootPath, sizeof(RootPath));
+    strcat(RootPath, "/HTMLsource");
+
+	//创建epollinfo
+	EpollInfo info;
+
 	//创建线程池
-	threadpool< http_conn > *pool = NULL;
+	//threadpool< http_conn > *pool = nullptr;
 	try {
 		pool = new threadpool< http_conn >;
 	}
@@ -83,14 +352,14 @@ int main( int argc, char *argv[] ) {
 	assert( http_users );
 	int user_count = 0;
 
-	int listenfd = socket( AF_INET, SOCK_STREAM, 0 );
-	assert( listenfd >= 0 );
+	info.listenfd = socket( AF_INET, SOCK_STREAM, 0 );
+	assert( info.listenfd >= 0 );
 	//设置长短连接
 	struct linger tmp = { 1, 0 };
-	setsockopt( listenfd, SOL_SOCKET, SO_LINGER, &tmp, sizeof( tmp ) );
+	setsockopt( info.listenfd, SOL_SOCKET, SO_LINGER, &tmp, sizeof( tmp ) );
 
 	//设置地址
-	int ret = 0;
+	info.ret = 0;
 	struct sockaddr_in address;
 	bzero( &address, sizeof( address ) );
 	address.sin_family = AF_INET;
@@ -98,29 +367,29 @@ int main( int argc, char *argv[] ) {
 	address.sin_port = htons( port );
 
 	//绑定
-	ret = bind( listenfd, ( struct sockaddr *)&address, 
+	info.ret = bind( info.listenfd, ( struct sockaddr *)&address, 
 	sizeof( address ) );
-	assert( ret >= 0 );
+	assert( info.ret >= 0 );
 
 	//设置监听上限
-	ret = listen( listenfd, 5 );
-	assert( ret >= 0 );
+	info.ret = listen( info.listenfd, 5 );
+	assert( info.ret >= 0 );
 
 	//epoll事件表
-	epoll_event events[ MAX_EVENT_NUMBER ];
-	int epollfd = epoll_create( 5 );
-	assert( epollfd != -1 );
+	info.events = new epoll_event[MAX_EVENT_NUMBER];
+	info.epollfd = epoll_create( 5 );
+	assert( info.epollfd != -1 );
 	//添加listenfd监听事件
-	addfd( epollfd, listenfd, false );
-	http_conn::m_epollfd = epollfd;
+	addfd( info.epollfd, info.listenfd, false );
+	http_conn::m_epollfd = info.epollfd;
 
 	//统一事件源，处理信号相关
 	//创建管道，注册读事件
-	ret = socketpair(AF_UNIX, SOCK_STREAM, 0, pipefd);
-	error_fun( ret, "socketpair");
+	info.ret = socketpair(AF_UNIX, SOCK_STREAM, 0, pipefd);
+	error_fun( info.ret, "socketpair");
 	//设置写管道非阻塞
 	setnonblocking( pipefd[1] );
-	addfd( epollfd, pipefd[0], false );
+	addfd( info.epollfd, pipefd[0], false );
 
 	//設置信号处理函数
 	addsig( SIGHUP );      	//控制终端挂起   1    
@@ -130,10 +399,10 @@ int main( int argc, char *argv[] ) {
 	addsig( SIGALRM );		//时钟信号
 	addsig( SIGPIPE );		//避免读客户端数据时意外关闭	
 	
-	bool stop_server = false;
+	info.stop_server = false;
+	info.timeout = false;  
 
-	client_data *timer_users = new client_data[MAX_FD];
-	bool timeout = false;  
+	timer_users = new client_data[MAX_FD];
 	alarm( TIMESLOT );     //开启第一个时钟
 
 	//日志相关
@@ -144,12 +413,12 @@ int main( int argc, char *argv[] ) {
 	//同步
 		Log::get_instance()->init("./ServerLogFolder/ServerLog", 0, 2000, 800000, 0);
 	//记录IP地址
-	char *Connect_IP = new char[16]();
+	info.Connect_IP = new char[16]();
 
 	//数据库相关
 	connection_pool *m_connPool = connection_pool::GetInstance();
-	//初始化数据库连接池，默认8个连接
-	m_connPool->init("localhost", "root", "123456Abc##", "WEBSERVERUSERS", 3306, 8, 0);
+	//初始化数据库连接池，默认9个连接
+	m_connPool->init("localhost", "root", "123456Abc##", "WEBSERVERUSERS", 3306, 9, 0);
 	//改变线程池中数据库连接池的指向
 	pool->m_connection_pool = m_connPool;
 	//从users表中检索username, password数据
@@ -176,123 +445,22 @@ int main( int argc, char *argv[] ) {
 	//释放内存
 	mysql_free_result(result);
 
-	//处理事件循环
-	while ( !stop_server ) {
-		int number = epoll_wait( epollfd, events, 
-		MAX_EVENT_NUMBER, -1 );
-		if ( ( number < 0 ) && ( errno != EINTR ) ) {
-			LOG_ERROR("epoll failure\n");
-			break;
-		}
-		for ( int i = 0; i < number; i++ ) {
-			int sockfd = events[i].data.fd;
-			if ( sockfd == listenfd ) {
-				struct sockaddr_in client_address;
-				socklen_t client_addrlength = 
-				sizeof( client_address);
-                //accept连接
-				int connfd = accept( listenfd, ( struct sockaddr*)
-				&client_address, &client_addrlength );
-				if ( connfd < 0 ) {
-                    LOG_ERROR("errno is :%d\n", errno);
-					continue;
-				}
-				if (http_conn::m_user_count >= MAX_FD ) {
-					continue;
-				}
-				//初始化连接
-				http_users[connfd].init( connfd, client_address );
+	if (isSync)
+	//模拟Proactor模型, 同步I/O
+		Sync_IO_EventLoop(info);
+	else
+	//Proactor模型, 异步IO
+		Async_IO_EventLoop(info);	
 
-				timer_users[connfd].address = client_address;
-				timer_users[connfd].sockfd = connfd;
-                //创建定时器 60 * 2s, 一圈
-				tw_timer *timer = timer_lst.add_timer( 60 );
-				timer->user_data = &timer_users[connfd];
-				timer->cb_func = cb_func;
-				timer_users[connfd].timer = timer;
-				//日志写入，有新的连接
-				inet_ntop(AF_INET, &client_address.sin_addr.s_addr, Connect_IP, INET_ADDRSTRLEN);
-				LOG_INFO("New Client Connect: %s:%d", Connect_IP, client_address.sin_port);
-			}
-			//管道 信号事件
-			else if ((sockfd == pipefd[0]) && 
-			(events[i].events & EPOLLIN)){
-				char signals[1024];
-				ret = recv( pipefd[0], signals, 
-				sizeof(signals), 0);
-				if ( ret <= 0)
-					continue;
-				else{
-					for (int i = 0; i < ret; i++)
-						switch (signals[i]){
-						case SIGHUP:
-						case SIGCHLD:
-						case SIGPIPE:
-							continue;
-						case SIGTERM:
-						case SIGINT:{
-							stop_server = true;
-							break;
-							}
-						case SIGALRM:{
-							timeout = true;
-							break;
-							}
-						}
-				}
-			}
-			//如果有异常，直接关闭连接
-			else if ( events[i].events & ( EPOLLRDHUP | 
-			EPOLLHUP | EPOLLERR ) ) {
-				if ( timer_users[sockfd].timer )
-					timer_lst.del_timer( timer_users[sockfd].timer );
-				cb_func( &timer_users[sockfd] );
-			}
-			//连接套接字接收到读事件
-			else if ( events[i].events & EPOLLIN ) {
-				if ( http_users[ sockfd ].read() ) {
-					pool->append( http_users + sockfd );
-					if ( timer_users[sockfd].timer ) {
-						//移动定时器, 在此基础上加一圈 或 不变
-						timer_lst.adjust_timer( timer_users[sockfd].timer, 0 );
-						LOG_INFO("%s", "adjust timer once\n");
-					}
-				}
-				else {
-					if ( timer_users[sockfd].timer )
-						timer_lst.del_timer( timer_users[sockfd].timer );
-					cb_func( &timer_users[sockfd] );
-				}
-			}
-			//连接套接字接收到写事件
-			else if ( events[i].events & EPOLLOUT ) {
-				if ( !http_users[ sockfd ].write() ) {
-					//LOG_ERROR("Write Error, Client Close: %s:%d", inet_ntop(timer_users[connfd].address.sin_addr.s_addr), timer_users[connfd].address.sin_port);
-					if ( timer_users[sockfd].timer )
-						timer_lst.del_timer( timer_users[sockfd].timer );
-					cb_func( &timer_users[sockfd] );
-				}
-			}
-			else
-				return 0;
-		}
-		//若接收到SIGALRM，执行timer_handler()
-		//timer_handler 时间轮转动一个刻度
-		if ( timeout ){
-			timer_handler();
-			timeout = false;
-		}
-
-	}
-
-	close( epollfd );
-	close( listenfd );
+	close( info.epollfd );
+	close( info.listenfd );
 	close( pipefd[1] );
 	close( pipefd[0] );
 	delete [] http_users;
 	delete [] timer_users;
 	delete pool;
-	delete [] Connect_IP;
+	delete [] info.events;
+	delete [] info.Connect_IP;
 	//delete timer_lst; 
 	
 	return 0;

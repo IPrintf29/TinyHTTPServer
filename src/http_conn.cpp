@@ -1,5 +1,7 @@
 #include "../include/http_conn.h"
 #include "../include/log.h"
+#include "../include/Timer_fun.h"
+#include "limits.h"
 
 const char *ok_200_title = "OK";
 const char *error_400_title = "BAD Request";
@@ -15,6 +17,10 @@ const char *error_500_title = "Internal Error";
 const char *error_500_form = "There was an unusual problem serving the \
 	requested file\n";
 
+extern bool isSync;
+extern aiocb64 *aiocbData;
+extern http_conn *http_users;
+
 //网站根目录，不能使用相对路径
 char RootPath[100];
 
@@ -24,7 +30,7 @@ int http_conn::m_user_count = 0;
 //map<string, string> http_conn::clientsInfo;
 LRUCache<string> http_conn::clientsInfo(50);
 
-void http_conn::init( int sockfd, const sockaddr_in &addr ) {
+void http_conn::init_sync( int sockfd, const sockaddr_in &addr ) {
 	m_sockfd = sockfd;
 	m_address = addr;
 	//避免TIME_WAIT，端口复用
@@ -35,6 +41,18 @@ void http_conn::init( int sockfd, const sockaddr_in &addr ) {
 	init();
 }
 
+void http_conn::init_async(int sockfd, const sockaddr_in &addr) {
+	m_sockfd = sockfd;
+	m_address = addr;
+	//避免TIME_WAIT，端口复用
+	int reuse = 1;
+	setsockopt( m_sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof( reuse ) );
+	//setnonblocking(sockfd);
+	setasync(sockfd);
+	setappend(sockfd);
+	init();
+}
+
 void http_conn::init() {
 	parser.init();
 	responser.init();
@@ -42,13 +60,19 @@ void http_conn::init() {
 	m_mysql = nullptr;
 }
 
-void http_conn::close_conn( bool real_close ) {
+void http_conn::close_conn_sync( bool real_close ) {
 	if ( real_close && ( m_sockfd != -1 ) ) {
 		removefd( m_epollfd, m_sockfd );
 		m_sockfd = -1;
 		m_user_count--;
 	}
 }
+
+void http_conn::close_conn_async( bool real_close ) {
+	if ( real_close && ( m_sockfd != -1 ) )
+		m_sockfd = -1;
+}
+
 
 //读操作：
 //read()将数据读入m_read_buf缓冲区
@@ -95,7 +119,7 @@ HTTP_CODE http_conn::process_read() {
 	== LINE_OK ) ) {
 		text = parser.get_line();
 		parser.m_start_line = parser.m_checked_idx;
-		printf( "got 1 http line: %s\n", text );
+		//printf( "got 1 http line: %s\n", text );
 		//主状态机状态
 		switch ( parser.m_check_state ) {
 			case CHECK_STATE_REQUESTLINE: {
@@ -404,15 +428,41 @@ void http_conn::process() {
 	HTTP_CODE read_ret = process_read();
 	//若无数据，继续注册读事件
 	if ( read_ret == NO_REQUEST ) {
-		modfd( m_epollfd, m_sockfd, EPOLLIN );
-		return;
+		if (isSync) {
+			modfd( m_epollfd, m_sockfd, EPOLLIN );
+			return;
+		}
+		else {
+			//cout << "no request" << endl;
+			//注册读完成事件
+			aiocbData[m_sockfd].aio_buf = http_users[m_sockfd].parser.m_read_buf + 
+				http_users[m_sockfd].parser.m_read_idx;
+			//信号通知方法
+			aiocbData[m_sockfd].aio_sigevent.sigev_signo = ASYNC_READ;
+			aio_read64(&aiocbData[m_sockfd]);
+			return;
+		}
 	}
 
 	//解析，写应答数据
 	bool write_ret = process_write( read_ret );
-	//如果解析写出错，直接关闭连接
-	if ( !write_ret ) 
-		close_conn();
-	//有数据可写，注册写事件
-	modfd( m_epollfd, m_sockfd, EPOLLOUT );
+	if (isSync) {
+		//如果解析写出错，直接关闭连接
+		if ( !write_ret )
+			close_conn_sync();
+		//有数据可写，注册写事件
+		modfd( m_epollfd, m_sockfd, EPOLLOUT );
+	}
+	else {
+		if (!write_ret)
+			close_conn_async();
+		//注册写完成事件
+		aiocbData[m_sockfd].aio_nbytes = http_users[m_sockfd].responser.m_write_idx;
+		aiocbData[m_sockfd].aio_buf = http_users[m_sockfd].responser.m_write_buf;
+		//信号通知方法
+		aiocbData[m_sockfd].aio_sigevent.sigev_signo = ASYNC_WRITE;
+		//线程调度方法
+		//aiocbData[m_sockfd].aio_sigevent.sigev_notify_function = thread_handler_aiowrite;
+		aio_write64(&aiocbData[m_sockfd]);
+	}
 }

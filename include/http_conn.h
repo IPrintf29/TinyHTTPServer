@@ -23,12 +23,16 @@
 #include <mysql/mysql.h>
 #include <map>
 #include <string>
+#include <aio.h>
 
 #include "locker.h"
 #include "httpparse.h"
 #include "httpresponse.h"
 #include "epoll_fun.h"
 #include "LRUCache.h"
+
+#define ASYNC_READ SIGUSR1
+#define ASYNC_WRITE SIGUSR2
 
 using namespace std;
 
@@ -41,10 +45,17 @@ class http_conn {
 		~http_conn() {}
 
 	public:
-		//初始化新接收的连接		
-		void init( int sockfd, const sockaddr_in &addr );
-		//关闭连接
-		void close_conn( bool real_close = true );
+		//初始化新接收的连接, 同步IO		
+		void init_sync( int sockfd, const sockaddr_in &addr );
+		//初始化新接收的连接, 异步IO		
+		void init_async( int sockfd, const sockaddr_in &addr );
+		//初始化连接
+		void init();
+		//关闭连接, 同步IO
+		void close_conn_sync( bool real_close = true );
+		//关闭连接, 异步IO
+		void close_conn_async( bool real_close = true );
+
 		//处理客户请求
 		void process();
 		//非阻塞读操作
@@ -53,8 +64,6 @@ class http_conn {
 		bool write();
 
 	private:
-		//初始化连接
-		void init();
 		//解析HTTP请求
 		HTTP_CODE process_read();
 		//填充HTTP应答
@@ -74,14 +83,14 @@ class http_conn {
 		
 		//当执行此任务时，可以获得数据库连接池中的一个连接
 		MYSQL *m_mysql;
+		//解析类 分别包含读写缓冲区
+		httpparser parser;
+		httpresponse responser;
 	
 	private:
 		int m_sockfd;
 		sockaddr_in m_address;
 		
-		httpparser parser;
-		httpresponse responser;
-
 		//客戶请求文件的完整路径，內容 = doc_root + m_url
 		char m_read_file[ FILENAME_LEN ];
 		//客戶请求的目标文件被mmap到內存中的起始位置

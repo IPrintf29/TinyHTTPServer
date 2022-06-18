@@ -151,8 +151,9 @@ HTTP_CODE httpparser::parse_headers( char *temp ) {
 		temp += strspn( temp, " \t" );
 		m_host = temp;
 	}
-	else
+	else {
         LOG_ERROR("I can not handle this header %s\n",temp);
+	}
 
 	return NO_REQUEST;
 }

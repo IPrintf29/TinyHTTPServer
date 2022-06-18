@@ -15,6 +15,20 @@ int setnonblocking( int fd ) {
 	return old_option;
 }
 
+int setappend( int fd ) {
+	int old_option = fcntl( fd, F_GETFL );
+	int new_option = old_option | O_APPEND;
+	fcntl( fd, F_SETFL, new_option );
+	return old_option;
+}
+
+int setasync( int fd ) {
+	int old_option = fcntl( fd, F_GETFL );
+	int new_option = old_option | O_ASYNC;
+	fcntl( fd, F_SETFL, new_option );
+	return old_option;
+}
+
 void addfd( int epollfd, int fd, bool one_shot ) {
 	struct epoll_event event;
 	event.data.fd = fd;
